@@ -1,0 +1,19 @@
+import os
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+TRAIN_DIR = os.path.join(DATA_DIR, 'train')
+VAL_DIR = os.path.join(DATA_DIR, 'val')
+TEST_DIR = os.path.join(DATA_DIR, 'test')
+MODEL_SAVE_PATH = os.path.join(BASE_DIR, 'best_model.pth')
+LOGS_DIR = os.path.join(BASE_DIR, 'logs')
+OUTPUTS_DIR = os.path.join(BASE_DIR, 'outputs')
+os.makedirs(LOGS_DIR, exist_ok=True)
+os.makedirs(OUTPUTS_DIR, exist_ok=True)
+BATCH_SIZE = 32
+LEARNING_RATE = 1e-4
+NUM_EPOCHS = 20
+NUM_CLASSES = 4
+IMAGE_SIZE = 224 
+CHANNELS = 3
+SEED = 42
+CLASS_NAMES = ['glioma', 'meningioma', 'notumor', 'pituitary']
