@@ -1,57 +1,82 @@
-import torch
-import torch.nn.functional as F
 import numpy as np
 import cv2
-from PIL import Image
+import torch
+import torch.nn.functional as F
 import matplotlib.cm as cm
+from PIL import Image
+
 
 class GradCAM:
     def __init__(self, model, target_layer):
-        self.model = model
+        self.model        = model
         self.target_layer = target_layer
-        self.gradients = None
-        self.activations = None
-        self.target_layer.register_full_backward_hook(self.save_gradients)
-        self.target_layer.register_forward_hook(self.save_activations)
+        self.gradients    = None
+        self.activations  = None
 
-    def save_gradients(self, module, grad_input, grad_output):
-        self.gradients = grad_output[0]
+        self._fwd = target_layer.register_forward_hook(self._save_activations)
 
-    def save_activations(self, module, input, output):
+    def _save_activations(self, module, input, output):
         self.activations = output
+        if output.requires_grad:
+            output.register_hook(self._save_gradients)
+        else:
+            output.retain_grad()
+            output.register_hook(self._save_gradients)
+
+    def _save_gradients(self, grad):
+        self.gradients = grad
+
+    def remove_hooks(self):
+        self._fwd.remove()
 
     def __call__(self, x, class_idx=None):
         self.model.eval()
-        output = self.model(x)
-        
-        if class_idx is None:
-            class_idx = torch.argmax(output, dim=1)
-        self.model.zero_grad()
-        target = output[0, class_idx]
-        target.backward()
-        pooled_gradients = torch.mean(self.gradients, dim=[0, 2, 3])
-        activations = self.activations[0]
-        for i in range(activations.shape[0]):
-            activations[i, :, :] *= pooled_gradients[i]
-        heatmap = torch.mean(activations, dim=0).cpu().detach().numpy()
+
+        with torch.enable_grad():
+            x = x.requires_grad_(True)
+            output = self.model(x)
+
+            if class_idx is None:
+                class_idx = output.argmax(dim=1).item()
+
+            self.model.zero_grad()
+            score = output[0, class_idx]
+            score.backward()
+
+        if self.gradients is None:
+            acts = self.activations[0].detach()
+            heatmap = acts.mean(dim=0).cpu().numpy()
+        else:
+            pooled = self.gradients.mean(dim=[0, 2, 3])
+            acts   = self.activations[0].clone().detach()
+            for i in range(acts.shape[0]):
+                acts[i] *= pooled[i]
+            heatmap = acts.mean(dim=0).cpu().numpy()
+
         heatmap = np.maximum(heatmap, 0)
-        if np.max(heatmap) != 0:
-            heatmap /= np.max(heatmap)
-        return heatmap, output
+        if heatmap.max() > 0:
+            heatmap /= heatmap.max()
+
+        return heatmap, output.detach()
+
 
 def generate_gradcam(model, img_tensor, target_class=None):
+   
     target_layer = model.get_last_conv_layer()
-    grad_cam = GradCAM(model, target_layer)
-    heatmap, prediction = grad_cam(img_tensor, target_class)
-    img_h, img_w = img_tensor.shape[2], img_tensor.shape[3]
-    heatmap = cv2.resize(heatmap, (img_w, img_h))
-    heatmap_colored = cm.jet(heatmap)[:, :, :3]
-    heatmap_colored = (heatmap_colored * 255).astype(np.uint8)
+    gc           = GradCAM(model, target_layer)
+
+    heatmap, prediction = gc(img_tensor, target_class)
+    gc.remove_hooks()
+
+    h, w = img_tensor.shape[2], img_tensor.shape[3]
+    heatmap_resized = cv2.resize(heatmap, (w, h))
+    heatmap_colored = (cm.jet(heatmap_resized)[:, :, :3] * 255).astype(np.uint8)
+
     mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
-    std = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
-    orig_img = img_tensor.cpu().numpy().squeeze().transpose(1, 2, 0)
-    orig_img = std * orig_img + mean
-    orig_img = np.clip(orig_img, 0, 1)
-    orig_img = (orig_img * 255).astype(np.uint8)
-    overlay = cv2.addWeighted(orig_img, 0.6, heatmap_colored, 0.4, 0)
+    std  = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
+    orig = img_tensor.cpu().detach().numpy().squeeze().transpose(1, 2, 0)
+    orig = np.clip(std * orig + mean, 0, 1)
+    orig = (orig * 255).astype(np.uint8)
+
+    overlay = cv2.addWeighted(orig, 0.6, heatmap_colored, 0.4, 0)
     return heatmap, Image.fromarray(overlay), prediction

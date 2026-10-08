@@ -1,108 +1,127 @@
-import streamlit as st
+import os, io
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from PIL import Image
-import numpy as np
-import os
-import pandas as pd
-import matplotlib.pyplot as plt
-import config
-import utils
-from model import BrainTumorCNN
+import streamlit as st
+
+import config, utils
+from model import get_model, MODEL_REGISTRY
 from gradcam import generate_gradcam
 
 st.set_page_config(
-    page_title="Brain Tumor Detector",
-    
-    layout="wide"
+    page_title="Brain Tumor Detector — BRISC2025",
+    layout="wide",
 )
 
-st.title(" Brain Tumor Detector — CNN + Grad-CAM")
-st.markdown("""Presented by: Vishal Singla and Rishit Goel""")
+st.title(" Brain Tumor Detector")
+st.caption("BRISC2025 Dataset · Custom CNN · ResNet-50 · EfficientNet-B3 · Grad-CAM")
 
-with st.expander("device"):
-    device = utils.get_device()
-    st.info(f"Running on: {device}")
+device = utils.get_device()
 
-@st.cache_resource
-def load_model():
-    if not os.path.exists(config.MODEL_SAVE_PATH):
-        return None
-    
-    model = BrainTumorCNN(num_classes=config.NUM_CLASSES)
-    checkpoint = torch.load(config.MODEL_SAVE_PATH, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
-    model.eval()
-    return model
+st.header("Settings")
+model_choice = st.selectbox(
+    "Select Model",
+    options=list(MODEL_REGISTRY.keys()),
+    format_func=lambda x: {
+        'custom_cnn':   ' Custom CNN (from scratch)',
+        'resnet50':     ' ResNet-50 (Transfer Learning)',
+        'efficientnet': ' EfficientNet-B3 (Transfer Learning)',
+        'mobilenetv3':  ' MobileNet-V3 (Transfer Learning)',
+    }.get(x, x)
+)
+st.markdown("---")
+st.markdown("**Classes:**")
+for c in config.CLASS_NAMES:
+    st.markdown(f"- {c}")
+st.markdown("---")
+st.info(f"Running on: **{device}**")
 
-model = load_model()
+summary_path = os.path.join(config.OUTPUTS_DIR, 'results_summary.csv')
+if os.path.exists(summary_path):
+    st.markdown("**Model Comparison (Test Set)**")
+    df = pd.read_csv(summary_path).drop_duplicates(subset='model', keep='last')
+    st.dataframe(df, hide_index=True, use_container_width=True)
+
+st.markdown("---")
+
+@st.cache_resource(show_spinner="Loading model weights…")
+def load_model(name: str):
+    path = config.model_save_path(name)
+    if not os.path.exists(path):
+        return None, None
+    ckpt  = torch.load(path, map_location=device)
+    model = get_model(name, num_classes=config.NUM_CLASSES)
+    model.load_state_dict(ckpt['model_state_dict'])
+    model.to(device).eval()
+    val_acc = ckpt.get('val_acc', None)
+    return model, val_acc
+
+model, val_acc = load_model(model_choice)
 
 if model is None:
-    st.error("Model not found! Please train the model first using `python train.py`.")
+    st.error(
+        f"No trained checkpoint found for **{model_choice}**.\n\n"
+        f"Train it first:\n```bash\npython train.py --model {model_choice}\n```"
+    )
     st.stop()
 
-col1, col2 = st.columns([1, 1])
+st.success(f"Loaded **{model_choice}** — Val Accuracy: {val_acc:.2f}%")
 
-with col1:
-    st.subheader("Input Image")
-    uploaded_file = st.file_uploader("Upload an MRI Scan", type=["jpg", "jpeg", "png"])
-    
+col_img, col_pred = st.columns([1, 1])
+
+with col_img:
+    st.subheader(" Input MRI Scan")
+    uploaded = st.file_uploader("Upload an MRI image", type=["jpg", "jpeg", "png"])
     image = None
-    if uploaded_file is not None:
-        if isinstance(uploaded_file, str): 
-            image = Image.open(uploaded_file).convert('RGB')
-        else: 
-            image = Image.open(uploaded_file).convert('RGB')
-        
-        st.image(image, caption="Original Image", use_container_width=True)
+    if uploaded:
+        image = Image.open(uploaded).convert("RGB")
+        st.image(image, caption="Uploaded MRI", use_container_width=True)
 
-with col2:
-    st.subheader("Prediction & Explanation")
-    
+with col_pred:
+    st.subheader(" Prediction & Grad-CAM")
+
     if image is not None:
-        img_resized = image.resize((config.IMAGE_SIZE, config.IMAGE_SIZE))
-        mean = [0.485, 0.456, 0.406]
-        std = [0.229, 0.224, 0.225]
-        
-        img_tensor = np.array(img_resized) / 255.0
-        img_tensor = (img_tensor - mean) / std
-        img_tensor = torch.FloatTensor(img_tensor).permute(2, 0, 1).unsqueeze(0).to(device)
-        
-        if st.button("Analyze MRI", type="primary"):
-            with st.spinner("Analyzing..."):
+        if st.button("Analyse MRI →", type="primary", use_container_width=True):
+            mean = config.IMAGENET_MEAN
+            std  = config.IMAGENET_STD
+
+            img_arr    = np.array(image.resize((config.IMAGE_SIZE, config.IMAGE_SIZE))) / 255.0
+            img_tensor = torch.FloatTensor(
+                (img_arr - mean) / std
+            ).permute(2, 0, 1).unsqueeze(0).to(device)
+
+            with st.spinner("Analysing…"):
                 heatmap, overlay, logits = generate_gradcam(model, img_tensor)
-                
-                probs = F.softmax(logits, dim=1).cpu().detach().numpy()[0]
-                pred_idx = np.argmax(probs)
+                probs      = F.softmax(logits, dim=1).cpu().detach().numpy()[0]
+                pred_idx   = int(probs.argmax())
                 pred_label = config.CLASS_NAMES[pred_idx]
-                pred_prob = probs[pred_idx]
-                
-                if pred_prob >= 0.8:
-                    st.success(f"Prediction: **{pred_label}** ({pred_prob:.2%})")
-                else:
-                    st.success(f"Prediction: **{pred_label}** ({pred_prob:.2%})")
-                
-                prob_df = pd.DataFrame({
-                    'Class': config.CLASS_NAMES,
-                    'Probability': probs
-                })
-                st.bar_chart(prob_df.set_index('Class'))
-                st.image(overlay, caption=f"Grad-CAM Heatmap (Focus Area)", use_container_width=True)
-                
-                import io
-                buf = io.BytesIO()
-                overlay.save(buf, format="PNG")
-                byte_im = buf.getvalue()
-                st.download_button(
-                label="Download Grad-CAM Overlay",
-                data=byte_im,
-                file_name="gradcam_overlay.png",
-                mime="image/png"
-                    )
+                pred_prob  = probs[pred_idx]
+
+            if pred_label == 'no_tumor':
+                st.success(f"**No Tumor Detected** ({pred_prob:.1%} confidence)")
+            else:
+                st.warning(f"**{pred_label.title()} Detected** ({pred_prob:.1%} confidence)")
+
+
+            prob_df = pd.DataFrame({
+                'Tumor Type': config.CLASS_NAMES,
+                'Probability': probs,
+            }).set_index('Tumor Type')
+            st.bar_chart(prob_df)
+
+
+            st.image(overlay, caption="Grad-CAM — highlighted regions drove the prediction",
+                     use_container_width=True)
+
+            
+    else:
+        st.info("Upload an MRI image on the left to get started.")
+
 st.markdown("---")
-st.markdown("""
-The **Grad-CAM (Gradient-weighted Class Activation Mapping)** visualization shows the regions of the image that were most important for the model's prediction.
-- **Red/Yellow areas**: High importance .
-- **Blue areas**: Low importance.
-""")
+st.markdown(
+    "**About Grad-CAM** — Gradient-weighted Class Activation Mapping highlights "
+    "which regions of the MRI most influenced the model's decision.  "
+    "🔴 Red/yellow = high importance.  🔵 Blue = low importance."
+)

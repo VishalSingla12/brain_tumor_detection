@@ -1,141 +1,141 @@
-import os
-import shutil
-import kagglehub
-import random
+import os, shutil, random
 from pathlib import Path
-import torch
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, WeightedRandomSampler
+
 import numpy as np
+import torch
+from torch.utils.data import DataLoader, WeightedRandomSampler, Subset
+from torchvision import datasets, transforms
+from sklearn.model_selection import train_test_split
+
 import config
 import utils
 
-def download_dataset():
-    print("Downloading dataset from Kaggle...")
-    path = kagglehub.dataset_download("masoudnickparvar/brain-tumor-mri-dataset")
-    print(f"Dataset downloaded to: {path}")
-    return path
 
-def organize_dataset(source_path):
-    print("Organizing dataset...")
-    source_path = Path(source_path)
-    training_dirs = list(source_path.rglob('Training'))
-    
-    if not training_dirs:
-        pass
+
+def get_transforms(augment: bool = True):
+   
+    normalise = transforms.Normalize(config.IMAGENET_MEAN, config.IMAGENET_STD)
+
+    if augment:
+        train_tf = transforms.Compose([
+            transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),          
+            transforms.RandomRotation(15),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.1),
+            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+            transforms.ToTensor(),
+            normalise,
+        ])
     else:
-        source_train = training_dirs[0]
-        source_test = source_train.parent / 'Testing'
-    for split in ['train', 'val', 'test']:
-        for class_name in config.CLASS_NAMES:
-            os.makedirs(os.path.join(config.DATA_DIR, split, class_name), exist_ok=True)
-    all_files = {class_name: [] for class_name in config.CLASS_NAMES}
-    def scan_and_collect(root_dir):
-        if not root_dir.exists(): return
-        for class_name in config.CLASS_NAMES:
-            class_dir = root_dir / class_name
-            if not class_dir.exists():
-                found = False
-                for child in root_dir.iterdir():
-                    if child.is_dir() and child.name.lower() == class_name.lower():
-                        class_dir = child
-                        found = True
-                        break
-                if not found: continue
-            
-            for img_path in class_dir.glob('*'):
-                if img_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.bmp']:
-                    all_files[class_name].append(img_path)
+        train_tf = transforms.Compose([
+            transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)),
+            transforms.ToTensor(),
+            normalise,
+        ])
 
-    scan_and_collect(source_train)
-    if source_test.exists():
-        scan_and_collect(source_test)
-    utils.seed_everything()
+    val_tf = transforms.Compose([
+        transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)),
+        transforms.ToTensor(),
+        normalise,
+    ])
+
+    return train_tf, val_tf
+
+
+def _check_brisc_exists():
     
-    for class_name, files in all_files.items():
-        random.shuffle(files)
-        n = len(files)
-        n_train = int(n * 0.7)
-        n_val = int(n * 0.15)
-        train_files = files[:n_train]
-        val_files = files[n_train:n_train+n_val]
-        test_files = files[n_train+n_val:]
-        print(f"Class {class_name}: {len(train_files)} train, {len(val_files)} val, {len(test_files)} test")
-        for f in train_files:
-            shutil.copy(f, os.path.join(config.TRAIN_DIR, class_name, f.name))
-        for f in val_files:
-            shutil.copy(f, os.path.join(config.VAL_DIR, class_name, f.name))
-        for f in test_files:
-            shutil.copy(f, os.path.join(config.TEST_DIR, class_name, f.name))
+    if not os.path.isdir(config.BRISC_TRAIN_DIR):
+        raise FileNotFoundError(
+            f"\n[ERROR] BRISC2025 dataset not found at:\n"
+            f"  {config.BRISC_TRAIN_DIR}\n\n"
+            f"Download steps:\n"
+            f"  1. Go to https://www.kaggle.com/datasets/briscdataset/brisc2025\n"
+            f"  2. Download & extract the archive\n"
+            f"  3. Place the 'brisc2025' folder inside:  {config.DATASET_ROOT}\n"
+            f"  OR set config.DATASET_ROOT to the correct path.\n"
+        )
 
-def get_transforms():
-    mean = [0.485, 0.456, 0.406]
-    std = [0.229, 0.224, 0.225]
-    train_transform = transforms.Compose([
-        transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(10),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std)
-    ])
-    val_transform = transforms.Compose([
-        transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std)
-    ])
-    return train_transform, val_transform
 
-def create_dataloaders():
-    train_transform, val_transform = get_transforms()
-    if not os.path.exists(config.TRAIN_DIR):
-        raw_path = download_dataset()
-        organize_dataset(raw_path)
-    train_dataset = datasets.ImageFolder(config.TRAIN_DIR, transform=train_transform)
-    val_dataset = datasets.ImageFolder(config.VAL_DIR, transform=val_transform)
-    test_dataset = datasets.ImageFolder(config.TEST_DIR, transform=val_transform)
-    targets = train_dataset.targets
-    class_counts = np.bincount(targets)
-    class_weights = 1. / class_counts
+def _build_weighted_sampler(dataset):
+    
+    targets = [dataset.targets[i] for i in range(len(dataset))]
+    class_counts = np.bincount(targets, minlength=config.NUM_CLASSES)
+    class_weights = 1.0 / class_counts.astype(float)
     sample_weights = class_weights[targets]
-    sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
-
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=config.BATCH_SIZE, 
-        sampler=sampler,
-        num_workers=2,
-        pin_memory=True
+    return WeightedRandomSampler(
+        weights=torch.tensor(sample_weights, dtype=torch.float),
+        num_samples=len(sample_weights),
+        replacement=True,
     )
+
+
+def create_dataloaders(batch_size: int = config.BATCH_SIZE,
+                       num_workers: int = 2,
+                       verbose: bool = True):
     
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=config.BATCH_SIZE, 
-        shuffle=False, 
-        num_workers=2,
-        pin_memory=True
-    )
-    
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=config.BATCH_SIZE, 
-        shuffle=False, 
-        num_workers=2,
-        pin_memory=True
-    )
-
-    return train_loader, val_loader, test_loader, train_dataset.classes
-
-if __name__ == "__main__":
+    _check_brisc_exists()
     utils.seed_everything()
-    if os.path.exists(config.DATA_DIR):
-        print(f"Data directory {config.DATA_DIR} already exists. Skipping download/organize.")
-    else:
-        raw_path = download_dataset()
-        organize_dataset(raw_path)
-    
+
+    train_tf, val_tf = get_transforms(augment=True)
+
+    full_train_ds = datasets.ImageFolder(config.BRISC_TRAIN_DIR,
+                                         transform=train_tf)
+    class_names   = full_train_ds.classes
+
+    all_idx     = list(range(len(full_train_ds)))
+    all_targets = full_train_ds.targets
+    train_idx, val_idx = train_test_split(
+        all_idx,
+        test_size=config.VAL_SPLIT,
+        stratify=all_targets,
+        random_state=config.SEED,
+    )
+
+    val_ds_base = datasets.ImageFolder(config.BRISC_TRAIN_DIR, transform=val_tf)
+
+    train_subset = Subset(full_train_ds, train_idx)
+    val_subset   = Subset(val_ds_base,   val_idx)
+
+    train_targets = [all_targets[i] for i in train_idx]
+    class_counts  = np.bincount(train_targets, minlength=config.NUM_CLASSES)
+    class_weights = 1.0 / class_counts.astype(float)
+    sample_weights = class_weights[train_targets]
+    sampler = WeightedRandomSampler(
+        weights=torch.tensor(sample_weights, dtype=torch.float),
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+    test_ds = datasets.ImageFolder(config.BRISC_TEST_DIR, transform=val_tf)
+
+    train_loader = DataLoader(train_subset, batch_size=batch_size,
+                              sampler=sampler, num_workers=num_workers,
+                              pin_memory=True)
+
+    val_loader   = DataLoader(val_subset, batch_size=batch_size,
+                              shuffle=False, num_workers=num_workers,
+                              pin_memory=True)
+
+    test_loader  = DataLoader(test_ds, batch_size=batch_size,
+                              shuffle=False, num_workers=num_workers,
+                              pin_memory=True)
+
+    if verbose:
+        print(f"Classes  : {class_names}")
+        print(f"Train    : {len(train_subset)} images")
+        print(f"Val      : {len(val_subset)} images")
+        print(f"Test     : {len(test_ds)} images")
+        counts = np.bincount(all_targets, minlength=config.NUM_CLASSES)
+        for i, c in enumerate(class_names):
+            print(f"  {c:<15} {counts[i]} total images")
+
+    return train_loader, val_loader, test_loader, class_names
+
+
+if __name__ == '__main__':
     tr, va, te, classes = create_dataloaders()
-    print(f"DataLoaders created. Classes: {classes}")
-    print(f"Train batches: {len(tr)}")
-    print(f"Val batches: {len(va)}")
-    print(f"Test batches: {len(te)}")
+    imgs, labels = next(iter(tr))
+    print(f"\nBatch shape : {imgs.shape}")
+    print(f"Label range : {labels.min().item()} – {labels.max().item()}")
+    print("DataLoader check passed ✓")
